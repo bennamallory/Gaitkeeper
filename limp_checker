@@ -1,0 +1,331 @@
+/*
+ * Purpose: To identify if an individual wearing the brace is limping or not and stream the data to Google Sheets
+ * Reference: Arduino Accelerometer and Gyroscope LSM6DS3 Pedometer Example
+ *            Internet of Things Arduino Cookbook
+ *            WifiNINA Example https://docs.arduino.cc/tutorials/communication/wifi-nina-examples#wifinina-wifi-web-client-repeating
+ * Authors: Elsy Meis, Elijah Sensibar, Mallory Benna
+ * Date Created: 15 Feb 2022
+ * Last Updated: 15 March 2022
+*/
+
+//Include all relevant libraries ======================================================
+// Pedometer libraries
+#include <Arduino_LSM6DS3.h> 
+#include "SparkFunLSM6DS3.h"
+#include "Wire.h"
+#define CLEAR_STEP      true
+#define NOT_CLEAR_STEP  false 
+
+//Wifi Libraries
+#include <SPI.h>
+#include <WiFiNINA.h>
+#include <WiFiUdp.h>
+
+//SD Card Libraries + Configuration
+#include <Arduino.h>
+#include "wiring_private.h"
+Uart mySerial (&sercom0, 5, 6, SERCOM_RX_PAD_1, UART_TX_PAD_0);
+// Attach the interrupt handler to the SERCOM
+void SERCOM0_Handler()
+{
+    mySerial.IrqHandler();
+}
+
+
+// WiFi credentials ======================================================
+char ssid[] = "BTUgoo";      //  your network SSID (name)
+char pass[] = "blowItUp";   // your network password
+int keyIndex = 0;
+int status = WL_IDLE_STATUS;
+
+//Include All Objects ======================================================
+//Initialize Wifi client library
+WiFiClient client;
+
+// Pedometer
+//Create a instance of class LSM6DS3
+LSM6DS3 pedometer( I2C_MODE, 0x6A );  //I2C device address 0x6A
+
+
+//Include all relevant variables ======================================================
+//IFTTT settings
+const char* host = "maker.ifttt.com";
+const char* eventName   = "gait_data";
+const char* key = "eDTAACjszB6kFAnT-Icj796fP0T12NmGKbntzHkuJeT";
+char server[] = "dweet.io"; //server address
+ 
+
+// Define Pin Variables
+const int potPin = A0; //pin for potentiometer
+const int buzzPin = 3; //pin for buzzer
+
+// Define potentiometer variables that are updated
+int potReading = 0; //pot value read from microcontroller
+int potSending = 0; //pot value transfered to google sheets and SD card
+
+//Define Step Count Variables
+uint8_t dataByte = 0;
+uint16_t stepCount = 0; //number of steps taken
+int old_step = 0; //old step count stored when steps update
+
+//Define Array for Potentiometer Readings
+const int MAX_ELEMENTS = 2; //max elements for array checking limp 
+int stepReadings[MAX_ELEMENTS]; //
+int maxVal = 0;
+int idx = 0;
+
+//Define Threshold Value for Limping
+int testVal = 960;
+
+// Variables will change:
+int buzzerState = LOW;             // ledState used to set the LED
+unsigned long previousMillis = 0;        // will store last time LED was updated
+const long interval = 3000;           // interval at which to blink (milliseconds)
+int buzz = false;
+
+
+//Set up Serial and Pedometer
+void setup() {
+  //Serial.begin(9600);
+
+  // Reassign pins 5 and 6 to SERCOM alt
+  pinPeripheral(5, PIO_SERCOM_ALT);
+  pinPeripheral(6, PIO_SERCOM_ALT);
+
+  // Start my new hardware serial
+  mySerial.begin(9600);
+  mySerial.println("Start Program");
+  
+  pinMode(3,OUTPUT);
+  if( pedometer.begin() != 0 ){
+    //Serial.println("Device error");
+  }
+  else{
+    //Serial.println("Device OK!");
+  }
+  
+  //Configure LSM6DS3 as pedometer 
+  if( 0 != config_pedometer(NOT_CLEAR_STEP) )
+  {
+    //Serial.println("Configure pedometer fail!");
+  }
+  //Serial.println("Success to Configure pedometer!");
+  
+
+  // check for the WiFi module:
+  if (WiFi.status() == WL_NO_MODULE) {
+    Serial.println("Communication with WiFi module failed!");
+    // don't continue
+    while (true);
+  }
+
+  String fv = WiFi.firmwareVersion();
+  if (fv < WIFI_FIRMWARE_LATEST_VERSION) {
+    Serial.println("Please upgrade the firmware");
+  }
+
+  // attempt to connect to Wifi network:
+  while (status != WL_CONNECTED) {
+    Serial.print("Attempting to connect to SSID: ");
+    Serial.println(ssid);
+    // Connect to WPA/WPA2 network. Change this line if using open or WEP network:
+    status = WiFi.begin(ssid, pass);
+  }
+  // you're connected now, so print out the status:
+  printWifiStatus();
+}
+
+
+
+//Pedometer Function - Accelerometer and Gyroscope LSM6DS3 Pedometer Example
+int config_pedometer(bool clearStep)
+{
+  uint8_t errorAccumulator = 0;
+  uint8_t dataToWrite = 0;  //Temporary variable
+
+  //Setup the accelerometer******************************
+  dataToWrite = 0; 
+  
+  //  dataToWrite |= LSM6DS3_ACC_GYRO_BW_XL_200Hz;
+  dataToWrite |= LSM6DS3_ACC_GYRO_FS_XL_2g;
+  dataToWrite |= LSM6DS3_ACC_GYRO_ODR_XL_26Hz;
+
+  
+  // Step 1: Configure ODR-26Hz and FS-2g
+  errorAccumulator += pedometer.writeRegister(LSM6DS3_ACC_GYRO_CTRL1_XL, dataToWrite);
+
+  // Step 2: Set bit Zen_G, Yen_G, Xen_G, FUNC_EN, PEDO_RST_STEP(1 or 0)
+  if(clearStep)
+    errorAccumulator += pedometer.writeRegister(LSM6DS3_ACC_GYRO_CTRL10_C, 0x3E);
+  else
+    errorAccumulator += pedometer.writeRegister(LSM6DS3_ACC_GYRO_CTRL10_C, 0x3C);
+  
+  // Step 3:  Enable pedometer algorithm
+  errorAccumulator += pedometer.writeRegister(LSM6DS3_ACC_GYRO_TAP_CFG1, 0x40);
+  
+  //Step 4: Step Detector interrupt driven to INT1 pin, set bit INT1_FIFO_OVR
+  errorAccumulator += pedometer.writeRegister( LSM6DS3_ACC_GYRO_INT1_CTRL, 0x10 );
+  
+  return errorAccumulator;
+}
+
+//Function to clear array values and reset counter variables
+void trashArray(){
+  Serial.println("TRASHING ARRAY");
+  memset(stepReadings,0,sizeof(stepReadings)); //set all values in array to 0
+  maxVal = 0; //reset maxVal for next iteration
+  idx = 0; //reset index to start of array
+}
+
+
+//Function to read potentiometer values and check limp
+int readPot(){
+  potReading = analogRead(potPin); //read potentiometer
+  Serial.print("POT READING:" );
+  Serial.println(potReading);
+
+  if(idx > (MAX_ELEMENTS-1)){ //Check size of array 
+    Serial.println("ARRAY FULL");
+    //determine if we are limping - dont add more values
+    Serial.print("MAX VAL: ");
+    Serial.println(maxVal);
+    if(maxVal < testVal){ //we are limping, so buzz
+      Serial.println("LIMPING,BUZZ");
+      trashArray();
+      buzz = true;
+    } else { //trash array, start over
+      Serial.println("NO LIMP, DONT BUZZ");
+      trashArray();
+      buzz = false;
+    }
+    
+  //Continue adding to array if not full yet
+  } else {
+      stepReadings[idx] = potReading; //put potentiometer value in array
+      Serial.print("StepReading:");
+      Serial.println(stepReadings[idx]);
+      if(stepReadings[idx] > maxVal){ //check if that recent value is larger than maxVal
+        maxVal = stepReadings[idx];
+        Serial.print("MAXVAL UPDATED: ");
+        Serial.println(maxVal);
+      }
+      idx += 1; //update index of array
+  }
+  return potReading;
+}
+
+//Function to buzz brace when limping is detected
+void buzzBrace(){
+  if(buzz == true){
+    Serial.println("ACTIVATING BUZZER");
+    digitalWrite(buzzPin,HIGH);
+    delay(3000);
+    buzz = false;
+    //digitalWrite(buzzPin, (milllis() % 2000 < 3000));
+  } else {
+    digitalWrite(buzzPin,LOW);
+    buzz = false;
+  }
+  delay(3000);
+  buzz = false;
+}
+
+void printWifiStatus() {
+  // print the SSID of the network you're attached to:
+  Serial.print("SSID: ");
+  Serial.println(WiFi.SSID());
+
+  // print your board's IP address:
+  IPAddress ip = WiFi.localIP();
+
+  Serial.print("IP Address: ");
+  Serial.println(ip);
+
+  // print the received signal strength:
+  long rssi = WiFi.RSSI();
+
+  Serial.print("signal strength (RSSI):");
+  Serial.print(rssi);
+  Serial.println(" dBm");
+}
+
+//Update the step count - Accelerometer and Gyroscope LSM6DS3 Pedometer Example
+void updateStepCount(){
+  old_step = stepCount; 
+
+  //Pedometer magic ==================================================
+  pedometer.readRegister(&dataByte, LSM6DS3_ACC_GYRO_STEP_COUNTER_H);
+  
+  //New step count calculated
+  stepCount = (dataByte << 8) & 0xFFFF;
+  
+  pedometer.readRegister(&dataByte, LSM6DS3_ACC_GYRO_STEP_COUNTER_L);
+  stepCount |=  dataByte;
+}
+
+//Function to connect Arduino to Google Sheets via IFTT
+void connectToSheets(int potSending){
+    Serial.print("connecting to ");
+    Serial.println(host);
+
+    // Use WiFiClient class to create TCP connections
+    const int httpPort = 80;
+    if (!client.connect(host, httpPort)) {
+      Serial.println("connection failed");
+      return;
+    }
+  
+    // We now create a URI for the request
+    String url = "/trigger/";
+    url += eventName;
+    url += "/with/key/";
+    url += key;
+    url += "?value1=";
+    url += String(potSending);
+    url +="&value2=";
+    url += String(testVal);
+  
+    Serial.print("Requesting URL: ");
+    Serial.println(url);
+  
+    // This will send the request to the server
+    client.print(String("GET ") + url + " HTTP/1.1\r\n" +
+                 "Host: " + host + "\r\n" +
+                 "Connection: close\r\n\r\n");
+    int timeout = millis() + 5000;
+    while (client.available() == 0) {
+      if (timeout - millis() < 0) {
+        Serial.println(">>> Client Timeout !");
+        client.stop();
+        return;
+      }
+    }
+  
+    // Read all the lines of the reply from server and print them to Serial
+    while(client.available()){
+      String line = client.readStringUntil('\r');
+      Serial.print(line);
+    }
+  
+    Serial.println();
+    Serial.println("closing connection");
+}
+
+//Loop to detect walking to start reading values
+void loop() {
+  //Pedometer updating
+  updateStepCount();
+
+  //Walking, so read pot values
+  if(old_step != stepCount){
+    potSending = readPot();
+    buzzBrace();
+    
+    //Log pot value to SD card
+    mySerial.print(potSending);
+    mySerial.println();
+
+    //Send values to Google Sheets
+    connectToSheets(potSending);
+  }
+}
